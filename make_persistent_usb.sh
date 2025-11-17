@@ -7,9 +7,10 @@
 #  - partition /dev/sdX as: 512MB EFI (FAT32) + remaining linux filesystem (btrfs)
 #  - create btrfs with subvolumes: @ (root) and @snapshots
 #  - debootstrap a minimal Debian system into the @ subvolume
-#  - install kernel, btrfs-progs, grub (UEFI+BIOS)
+#  - install kernel, btrfs-progs, grub (UEFI+BIOS), network tools
 #  - copy your snapshot script into /usr/local/bin on the USB system
 #  - install GRUB config to boot the USB (both UEFI and BIOS)
+#  - configure NetworkManager for automatic network connectivity
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -50,6 +51,7 @@ PASSWORD="usbuser"   # change later or create interactive user
 LOCALE="en_US.UTF-8"
 TIMEZONE="UTC"
 DEBOOTSTRAP_MIRROR="http://deb.debian.org/debian"
+DEBOOTSTRAP_COMPONENTS="main,contrib,non-free,non-free-firmware"
 
 # --- Partitioning ---
 echo ">>> Partitioning $DEV"
@@ -112,7 +114,7 @@ if ! command -v debootstrap >/dev/null 2>&1; then
   exit 1
 fi
 
-debootstrap --variant=minbase --include=linux-image-amd64,grub-efi-amd64,grub-pc,btrfs-progs,cloud-guest-utils,locales,ca-certificates,sudo,systemd-sysv "$SUITE" "$MOUNT_POINT" "$DEBOOTSTRAP_MIRROR"
+debootstrap --variant=minbase --components="${DEBOOTSTRAP_COMPONENTS}" --include=linux-image-amd64,btrfs-progs,locales,ca-certificates,sudo,systemd-sysv,iproute2,iputils-ping "$SUITE" "$MOUNT_POINT" "$DEBOOTSTRAP_MIRROR"
 
 # --- Basic chroot setup ---
 echo ">>> Preparing chroot environment"
@@ -135,8 +137,33 @@ mkdir -p "$MOUNT_POINT/$SNAP_SUBVOL"
 # set hostname, locale
 echo "$HOSTNAME" > "$MOUNT_POINT/etc/hostname"
 chroot "$MOUNT_POINT" /bin/bash -c "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime || true; dpkg-reconfigure -f noninteractive tzdata || true"
-chroot "$MOUNT_POINT" /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends linux-image-amd64 btrfs-progs grub-efi-amd64 grub-pc sudo locales"
+
+# Install additional packages including network tools and GRUB packages separately
+echo ">>> Installing base packages and network tools"
+chroot "$MOUNT_POINT" /bin/bash -c "apt-get update && apt-get install -y --no-install-recommends linux-image-amd64 btrfs-progs sudo locales network-manager wireless-tools wpasupplicant firmware-iwlwifi firmware-realtek firmware-atheros dnsutils curl wget grub-common grub2-common"
+
+# Install GRUB packages with special handling to avoid conflicts
+echo ">>> Installing GRUB bootloaders"
+chroot "$MOUNT_POINT" /bin/bash -c "apt-get install -y --no-install-recommends grub-efi-amd64-bin grub-pc-bin"
+
 chroot "$MOUNT_POINT" /bin/bash -c "sed -i 's/^# $LOCALE/$LOCALE/' /etc/locale.gen || true; locale-gen"
+
+# Enable NetworkManager service
+echo ">>> Enabling NetworkManager"
+chroot "$MOUNT_POINT" /bin/bash -c "systemctl enable NetworkManager"
+
+# Configure basic network settings
+cat > "$MOUNT_POINT/etc/NetworkManager/NetworkManager.conf" <<'NMCONF'
+[main]
+plugins=ifupdown,keyfile
+dns=default
+
+[ifupdown]
+managed=true
+
+[device]
+wifi.scan-rand-mac-address=no
+NMCONF
 
 # create user
 chroot "$MOUNT_POINT" /bin/bash -c "useradd -m -s /bin/bash -G sudo $USERNAME || true; echo '$USERNAME:$PASSWORD' | chpasswd"
@@ -171,9 +198,6 @@ if [ -n "$SNAP_SCRIPT_SRC" ]; then
   install -m 0755 "$SNAP_SCRIPT_SRC" "$MOUNT_POINT/usr/local/bin/btrfs-grub-snapshots"
 fi
 
-# Add a helper to regenerate grub entries at boot/install time
-chroot "$MOUNT_POINT" /bin/bash -c "apt-get install -y --no-install-recommends btrfs-progs"
-
 # create a small systemd service to ensure @snapshots dir exists on first boot
 cat > "$MOUNT_POINT/etc/systemd/system/create-snapdir.service" <<'EOF'
 [Unit]
@@ -182,17 +206,43 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'set -e; if [ ! -d /$SNAP_SUBVOL ]; then mkdir -p /$SNAP_SUBVOL || true; fi'
+ExecStart=/bin/bash -c 'set -e; if [ ! -d /@snapshots ]; then mkdir -p /@snapshots || true; fi'
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Adapt the placeholder $SNAP_SUBVOL inside the file with proper name
-sed -i "s|/$SNAP_SUBVOL|/$SNAP_SUBVOL|g" "$MOUNT_POINT/etc/systemd/system/create-snapdir.service"
-
 chroot "$MOUNT_POINT" /bin/bash -c "systemctl enable create-snapdir.service || true"
+
+# Create network setup helper script for first boot
+cat > "$MOUNT_POINT/usr/local/bin/setup-network" <<'NETSCRIPT'
+#!/bin/bash
+# Quick network setup helper
+
+echo "=== Network Setup Helper ==="
+echo ""
+echo "For Ethernet (wired connection):"
+echo "  Connection should work automatically via DHCP"
+echo "  Check status: nmcli device status"
+echo ""
+echo "For WiFi:"
+echo "  1. List available networks:"
+echo "     nmcli device wifi list"
+echo "  2. Connect to network:"
+echo "     nmcli device wifi connect 'SSID' password 'PASSWORD'"
+echo "  3. Or use interactive mode:"
+echo "     nmtui"
+echo ""
+echo "Useful commands:"
+echo "  nmcli connection show        # Show all connections"
+echo "  nmcli device status          # Show device status"
+echo "  ip addr show                 # Show IP addresses"
+echo "  ping -c 4 8.8.8.8           # Test connectivity"
+echo ""
+NETSCRIPT
+
+chmod +x "$MOUNT_POINT/usr/local/bin/setup-network"
 
 # Final grub update inside chroot (so kernels are detected)
 chroot "$MOUNT_POINT" /bin/bash -c "update-grub || true"
@@ -213,8 +263,22 @@ cat <<MSG
 1) Login as $USERNAME (password: $PASSWORD). Immediately:
    sudo passwd $USERNAME              # set a real password
    sudo visudo                        # optionally allow passwordless sudo for your user
-2) Verify the snapshot script exists at /usr/local/bin/btrfs-grub-snapshots and is executable.
-3) Run: sudo btrfs-grub-snapshots create-snapshot "initial"   # creates first snapshot
-4) Reboot and test selecting the 'snapshot' entry in GRUB.
+
+2) Network setup:
+   - For Ethernet: Should connect automatically
+   - For WiFi: Run 'nmcli device wifi list' to see networks
+              Then: 'nmcli device wifi connect SSID password PASSWORD'
+              Or use: 'nmtui' for interactive setup
+   - Helper script available: setup-network
+
+3) Verify the snapshot script exists at /usr/local/bin/btrfs-grub-snapshots and is executable.
+
+4) Install any dependencies for your snapshot script if needed:
+   sudo apt update
+   sudo apt install <required-packages>
+
+5) Run: sudo btrfs-grub-snapshots create-snapshot "initial"   # creates first snapshot
+
+6) Reboot and test selecting the 'snapshot' entry in GRUB.
 
 MSG
